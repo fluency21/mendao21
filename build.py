@@ -17,6 +17,7 @@ from pathlib import Path
 SITE_TITLE = "每日看门道"
 SITE_SUB = "AI 资讯五层解码 · 团队共读 · 深挖转化"
 SHEET_URL = "https://docs.qq.com/sheet/DV0tCaEFGRFl6UUFs?_fid=WKBhAFDYzQAl"
+SHOW_TOPICS = False  # 2026-09-13 用户要求：专题页对外隐藏（分享对象看不懂），数据保留，改 True 即恢复
 
 LAYERS = [
     ("说人话", "l-a", "一句话讲清发生了什么"),
@@ -43,7 +44,7 @@ def md_inline(s):
     return s
 
 def md_to_html(md):
-    out, in_list, in_code, code_buf, para = [], False, False, [], []
+    out, in_list, in_code, code_buf, para, tbl = [], False, False, [], [], []
 
     def flush_para():
         nonlocal para
@@ -57,9 +58,23 @@ def md_to_html(md):
             out.append("</ul>")
             in_list = False
 
+    def flush_tbl():
+        nonlocal tbl
+        if tbl:
+            rows = [r for r in tbl if not re.match(r"^\|[\s:\-|]+\|$", r.strip())]
+            h = ["<table>"]
+            for i, r in enumerate(rows):
+                cells = [c.strip() for c in r.strip().strip("|").split("|")]
+                tag = "th" if i == 0 else "td"
+                h.append("<tr>" + "".join("<%s>%s</%s>" % (tag, md_inline(c), tag) for c in cells) + "</tr>")
+            h.append("</table>")
+            out.append("\n".join(h))
+            tbl = []
+
     for line in md.split("\n"):
         raw = line.rstrip()
         if raw.strip().startswith("```"):
+            flush_tbl()
             if in_code:
                 out.append("<pre><code>" + html.escape("\n".join(code_buf)) + "</code></pre>")
                 code_buf, in_code = [], False
@@ -70,24 +85,33 @@ def md_to_html(md):
             code_buf.append(raw); continue
         s = raw.strip()
         if not s:
-            flush_para(); flush_list(); continue
+            flush_para(); flush_list(); flush_tbl(); continue
+        if s.startswith(">"):
+            s = s.lstrip("> ").strip()
+            if not s:
+                continue
+        if s.startswith("|"):
+            flush_para(); flush_list()
+            tbl.append(s)
+            continue
         if s == "---":
-            flush_para(); flush_list(); out.append("<hr>"); continue
+            flush_para(); flush_list(); flush_tbl(); out.append("<hr>"); continue
         m = re.match(r"^(#{2,5})\s+(.*)$", s)
         if m:
-            flush_para(); flush_list()
+            flush_para(); flush_list(); flush_tbl()
             lv = len(m.group(1)) + 2
             out.append("<h%d>%s</h%d>" % (lv, md_inline(m.group(2)), lv))
             continue
         m = re.match(r"^[-*]\s+(.*)$", s)
         if m:
-            flush_para()
+            flush_para(); flush_tbl()
             if not in_list:
                 out.append("<ul>"); in_list = True
             out.append("<li>" + md_inline(m.group(1)) + "</li>")
             continue
+        flush_tbl()
         para.append(s)
-    flush_para(); flush_list()
+    flush_para(); flush_list(); flush_tbl()
     return "\n".join(out)
 
 # ===== 日报解析（结构化五层）=====
@@ -180,7 +204,7 @@ def card_html(date, it):
         '<div class="card-actions">'
         '<button class="btn btn-primary" data-dive="{ctx}">立即深挖</button>'
         '<button class="btn btn-ghost" data-mine="{ctx}">按我的行业看「与我何干」</button>'
-        '<a class="btn btn-ghost" href="{sheet}" target="_blank" rel="noopener">转化需求</a>'
+        '<button class="btn btn-ghost" onclick="openNeed()">转化需求</button>'
         '</div></article>'
     ).format(
         anchor=anchor, date=date, title=html.escape(it["title"], quote=True),
@@ -202,7 +226,7 @@ def day_block(day, open_=False):
 
 # ===== 索引解析 =====
 THEME_RE = re.compile(r"^##\s+(.+)$")
-ENTRY_RE = re.compile(r"^-\s+\[(\d{2}-\d{2})\]\s*(.+)$")
+ENTRY_RE = re.compile(r"^-\s+\[(\d{2}-\d{2}|W\d+)\]\s*(.+)$")
 
 def parse_index(path):
     themes, cur = [], None
@@ -217,7 +241,7 @@ def parse_index(path):
             cur["entries"].append({"mmdd": m.group(1), "text": m.group(2).strip()})
     return themes
 
-def themes_html(themes):
+def themes_html(themes, week_anchor=""):
     chips = '<button class="chip active" data-theme="all">全部</button>'
     for t in themes:
         chips += '<button class="chip" data-theme="%s">%s</button>' % (
@@ -226,9 +250,14 @@ def themes_html(themes):
     for t in themes:
         lis = ""
         for e in sorted(t["entries"], key=lambda x: x["mmdd"], reverse=True):
-            day = "2026-" + e["mmdd"]
-            lis += ('<li><a class="t-link" data-day="%s"><span class="t-date">%s</span>%s</a></li>'
-                    % (day, e["mmdd"], html.escape(e["text"])))
+            if e["mmdd"].startswith("W"):
+                # 周报条目：跳到历史页顶部的周报区块
+                lis += ('<li><a class="t-link" data-day="%s"><span class="t-date">%s</span>%s</a></li>'
+                        % (week_anchor, e["mmdd"], html.escape(e["text"])))
+            else:
+                day = "2026-" + e["mmdd"]
+                lis += ('<li><a class="t-link" data-day="%s"><span class="t-date">%s</span>%s</a></li>'
+                        % (day, e["mmdd"], html.escape(e["text"])))
         groups += ('<div class="theme-group" data-theme="%s"><div class="theme-name">%s'
                    '<span class="theme-n">%d</span></div><ul class="t-list">%s</ul></div>'
                    % (html.escape(t["name"], quote=True), html.escape(t["name"]), len(t["entries"]), lis))
@@ -262,7 +291,30 @@ def main():
 
     idx = base / "索引.md"
     theme_data = parse_index(idx) if idx.exists() else []
-    theme_html = themes_html(theme_data) if theme_data else '<p class="muted">暂无索引</p>'
+
+    # ===== 周报（最新页置顶展示 + 历史页存档）=====
+    week_dir = base / "周报"
+    weeks_html, week_anchor, week_today = "", "", ""
+    if week_dir.exists():
+        wfiles = sorted(week_dir.glob("*.md"))
+        for p in wfiles:
+            wid = "day-week-" + p.stem
+            body = md_to_html(p.read_text(encoding="utf-8"))
+            weeks_html += ('<details class="day week" id="%s"><summary>'
+                           '<span class="day-date">📅 周报 · %s</span><span class="day-count">本周复盘</span>'
+                           '</summary><div class="day-body week-body">%s</div></details>'
+                           % (wid, html.escape(p.stem), body))
+        if wfiles:
+            week_anchor = "week-" + wfiles[-1].stem
+            # 最新周报若新于最新日报，作为"最新"页主内容展开显示
+            if wfiles[-1].stem[:10] > latest["date"]:
+                body = md_to_html(wfiles[-1].read_text(encoding="utf-8"))
+                week_today = ('<section class="week-today">'
+                              '<div class="week-banner">📅 本周复盘 · %s</div>'
+                              '<div class="week-body">%s</div></section>'
+                              % (html.escape(wfiles[-1].stem), body))
+
+    theme_html = themes_html(theme_data, week_anchor) if theme_data else '<p class="muted">暂无索引</p>'
 
     board = (
         '<div class="panel"><div class="panel-title">需求池怎么玩</div>'
@@ -276,10 +328,15 @@ def main():
         '<p class="muted center">表格内含两个子表：情报投稿 / 需求池，在文档底部切换</p>'
     )
 
+    today_html = week_today + (
+        '<div class="latest-mark" style="margin-top:30px">最近一篇日报 · <b>%s</b></div>' % latest["date"]
+        if week_today else ""
+    ) + day_block(latest, open_=True)
+
     data = {
         "title": SITE_TITLE, "sub": SITE_SUB, "sheet": SHEET_URL,
-        "date": latest["date"], "today": day_block(latest, open_=True),
-        "archive": "\n".join(day_block(d) for d in rest) or '<p class="muted">暂无历史</p>',
+        "date": ("周报 " + wfiles[-1].stem) if week_today else latest["date"], "today": today_html,
+        "archive": weeks_html + ("\n".join(day_block(d) for d in rest) or '<p class="muted">暂无历史</p>'),
         "topics": topics, "themes": theme_html, "board": board,
         "ndays": str(len(days)), "nitems": str(total_items), "nthemes": str(len(theme_data)),
         "dive_prompt": DIVE_PROMPT.replace("{ctx}", "__CTX__"),
@@ -290,7 +347,10 @@ def main():
     print("OK ->", out_dir / "index.html", "| days:", len(days), "| items:", total_items)
 
 def render(d):
+    nav_topics = ('\n<button data-page="page-topics" onclick="switchPage(\'page-topics\',this)">专题</button>' if SHOW_TOPICS else "")
+    page_topics = ('\n<div class="page" id="page-topics">%s</div>' % d["topics"] if SHOW_TOPICS else "")
     return PAGE.replace("__CSS__", CSS).replace("__JS__", JS) \
+        .replace("__NAV_TOPICS__", nav_topics).replace("__PAGE_TOPICS__", page_topics) \
         .replace("__TITLE__", d["title"]).replace("__SUB__", d["sub"]) \
         .replace("__SHEET__", d["sheet"]).replace("__DATE__", d["date"]) \
         .replace("__NDAYS__", d["ndays"]).replace("__NITEMS__", d["nitems"]) \
@@ -436,6 +496,29 @@ body[data-theme="dark"] .panel{background:#1e1e1a;border-color:#2e2e27}
 .center{text-align:center}
 .muted{color:#999;font-size:13px}
 
+/* 周报（最新页） */
+.week-today{background:#fff;border:1px solid #eceae2;border-radius:18px;margin:18px 0;overflow:hidden;
+box-shadow:0 1px 2px rgba(0,0,0,.03)}
+body[data-theme="dark"] .week-today{background:#1e1e1a;border-color:#2e2e27}
+.week-banner{background:linear-gradient(135deg,#0f766e,#14b8a6);color:#fff;font-weight:650;
+font-size:15px;padding:13px 20px}
+.week-body{padding:6px 22px 20px;font-size:14px}
+.week-body h3,.week-body h4,.week-body h5{margin:18px 0 6px;line-height:1.5}
+.week-body h3{font-size:16.5px}
+.week-body h4{font-size:15px}
+.week-body h5{font-size:14px}
+.week-body p{margin:8px 0}
+.week-body ul{margin:8px 0 8px 20px}
+.week-body li{margin:3px 0}
+.week-body table{width:100%;border-collapse:collapse;margin:12px 0;font-size:13px}
+.week-body th,.week-body td{border:1px solid #e5e3da;padding:7px 10px;text-align:left;vertical-align:top}
+.week-body th{background:#f2f1ea;font-weight:600}
+body[data-theme="dark"] .week-body th,body[data-theme="dark"] .week-body td{border-color:#3a3a32}
+body[data-theme="dark"] .week-body th{background:#2b2b25}
+.week-body hr{border:none;border-top:1px solid #eceae2;margin:16px 0}
+body[data-theme="dark"] .week-body hr{border-top-color:#2e2e27}
+.week-body a{word-break:break-all}
+
 /* 历史（折叠天） */
 .divider{color:#999;font-size:12.5px;font-weight:600;margin:22px 0 2px;letter-spacing:1px}
 details.day{background:#fff;border:1px solid #eceae2;border-radius:16px;margin:12px 0;overflow:hidden}
@@ -514,6 +597,19 @@ body[data-theme="dark"] .form-row input,body[data-theme="dark"] .form-row select
 font-size:13px;border-radius:10px;padding:11px 20px;opacity:0;transition:opacity .25s;pointer-events:none;z-index:200}
 .toast.show{opacity:1}
 footer{max-width:780px;margin:0 auto;padding:0 20px 46px;color:#aaa;font-size:12px;line-height:2}
+
+/* 提示词弹窗（免 Key 通用交互） */
+.prompt-box{width:100%;min-height:220px;resize:vertical;border:1px solid #e2e0da;border-radius:10px;
+padding:12px 14px;font-size:13px;line-height:1.8;font-family:inherit;background:#fbfaf7;color:inherit}
+body[data-theme="dark"] .prompt-box{background:#1c1c1a;border-color:#3a3a36}
+.quick-ai{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+.quick-ai a{flex:1;min-width:100px;text-align:center;text-decoration:none;font-size:13px;font-weight:600;
+border:1px solid #e2e0da;border-radius:10px;padding:9px 6px;color:inherit;background:#fff}
+.quick-ai a:hover{border-color:#0f766e;color:#0f766e}
+body[data-theme="dark"] .quick-ai a{background:#1c1c1a;border-color:#3a3a36}
+body[data-theme="dark"] .quick-ai a:hover{border-color:#5DCAA5;color:#5DCAA5}
+.byok-link{display:block;text-align:center;font-size:12px;color:#999;margin-top:12px;cursor:pointer}
+.byok-link:hover{color:#0f766e}
 """
 
 JS = r"""
@@ -610,6 +706,8 @@ function saveSettings(){
   localStorage.setItem('kd_api_key', document.getElementById('cfgKey').value.trim());
   localStorage.setItem('kd_api_model', document.getElementById('cfgModel').value.trim()||'deepseek-chat');
   hideModal('settingsModal'); toast('已保存，仅存在你的浏览器里');
+  var p = window._pendingPrompt; window._pendingPrompt = null;
+  if(p){ setTimeout(function(){ p.kind==='dive' ? startDive(p.ctx) : startMine(p.ctx); }, 300); }
 }
 
 /* ===== AI 会话弹窗 ===== */
@@ -618,19 +716,19 @@ function showModal(id){document.getElementById(id).classList.add('show')}
 function hideModal(id){document.getElementById(id).classList.remove('show')}
 
 function startDive(ctx){
+  if(!aiCfg().key){ openPromptModal('dive', ctx); return; }
   chat = {messages:[], busy:false};
   document.getElementById('chatBody').innerHTML = '';
   document.getElementById('chatTitle').textContent = 'AI 深挖';
   showModal('chatModal');
-  if(!aiCfg().key){ hideModal('chatModal'); openSettings(); toast('先配置一个 API Key 才能页内深挖'); return; }
   askAI(DIVE_TMPL.replace('__CTX__', ctx));
 }
 function startMine(ctx){
+  if(!aiCfg().key){ openPromptModal('mine', ctx); return; }
   chat = {messages:[], busy:false};
   document.getElementById('chatBody').innerHTML = '';
   document.getElementById('chatTitle').textContent = '与我何干 · 按我的行业';
   showModal('chatModal');
-  if(!aiCfg().key){ hideModal('chatModal'); openSettings(); toast('先配置一个 API Key'); return; }
   var profile = localStorage.getItem('kd_profile')||'';
   if(!profile){
     hideModal('chatModal'); showModal('profileModal');
@@ -638,6 +736,36 @@ function startMine(ctx){
   }
   askProfile(ctx, profile);
 }
+
+/* ===== 免 Key 通用交互：提示词弹窗 + 需求池说明 ===== */
+function buildPrompt(kind, ctx){
+  if(kind==='dive') return DIVE_TMPL.replace('__CTX__', ctx);
+  var profile = localStorage.getItem('kd_profile')||'（在这里填一句你的行业和岗位，例：电商运营，负责私域转化）';
+  return '以下是一条 AI 行业资讯：\n' + ctx +
+    '\n\n我的背景：' + profile +
+    '\n请结合我的行业与岗位，输出「与我何干」：先点出这条资讯和我工作的具体关联，再给 1-2 个可执行的动作建议，要具体，不要说空话。';
+}
+function openPromptModal(kind, ctx){
+  window._pendingPrompt = {kind:kind, ctx:ctx};
+  document.getElementById('promptTitle').textContent = kind==='dive' ? 'AI 深挖 · 提示词已备好' : '与我何干 · 提示词已备好';
+  document.getElementById('promptBox').value = buildPrompt(kind, ctx);
+  showModal('promptModal');
+}
+function copyPrompt(){
+  var box = document.getElementById('promptBox');
+  var done = function(){ toast('已复制 ✓ 粘贴给你常用的 AI 就行'); };
+  box.select();
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(box.value).then(done, function(){ document.execCommand('copy'); done(); });
+  }else{
+    document.execCommand('copy'); done();
+  }
+  box.blur();
+}
+function gotoSettingsFromPrompt(){
+  hideModal('promptModal'); openSettings(); toast('保存 Key 后会自动继续刚才的解读');
+}
+function openNeed(){ showModal('needModal'); }
 function saveProfile(){
   var v = document.getElementById('profileInput').value.trim();
   if(!v){ toast('先写一句你的行业和岗位'); return; }
@@ -764,8 +892,7 @@ PAGE = """<!DOCTYPE html>
 <span class="brand">看<em>门</em>道</span>
 <div class="tabs">
 <button class="active" data-page="page-today" onclick="switchPage('page-today',this)">最新</button>
-<button data-page="page-archive" onclick="switchPage('page-archive',this)">历史</button>
-<button data-page="page-topics" onclick="switchPage('page-topics',this)">专题</button>
+<button data-page="page-archive" onclick="switchPage('page-archive',this)">历史</button>__NAV_TOPICS__
 <button data-page="page-themes" onclick="switchPage('page-themes',this)">分类索引</button>
 <button data-page="page-board" onclick="switchPage('page-board',this)">需求池</button>
 </div>
@@ -797,15 +924,14 @@ PAGE = """<!DOCTYPE html>
 <div class="latest-mark">最新一期 · <b>__DATE__</b></div>
 __TODAY__
 </div>
-<div class="page" id="page-archive">__ARCHIVE__</div>
-<div class="page" id="page-topics">__TOPICS__</div>
+<div class="page" id="page-archive">__ARCHIVE__</div>__PAGE_TOPICS__
 <div class="page" id="page-themes">__THEMES__</div>
 <div class="page" id="page-board">__BOARD__</div>
 </main>
 
 <footer>
 每日看门道 · 内容由 ai-news-digest 五层解码生成<br>
-页内 AI 深挖为 BYOK 模式：API Key 仅存储在你自己的浏览器中，不经过任何服务器。
+「立即深挖 / 与我何干」默认生成提示词，复制后粘贴到任意 AI 即可使用；配置自己的 API Key（仅存浏览器）可解锁页内直聊。
 </footer>
 
 <!-- 设置弹窗 -->
@@ -854,6 +980,48 @@ __TODAY__
 <div class="modal-foot">
 <input id="chatInput" placeholder="继续追问… 回车发送">
 <button class="btn btn-primary" onclick="followUp()">发送</button>
+</div>
+</div>
+</div>
+
+<!-- 提示词弹窗（免 Key 通用交互） -->
+<div class="modal-mask" id="promptModal">
+<div class="modal">
+<div class="modal-head"><span class="modal-title" id="promptTitle">提示词已备好</span>
+<button class="modal-close" onclick="hideModal('promptModal')">×</button></div>
+<div class="modal-body">
+<textarea class="prompt-box" id="promptBox" readonly></textarea>
+<div class="form-tip">第 1 步：点下方「一键复制」；第 2 步：打开你常用的 AI，粘贴发送。也可以直接点下面的快捷入口：</div>
+<div class="quick-ai">
+<a href="https://chat.deepseek.com" target="_blank" rel="noopener">DeepSeek</a>
+<a href="https://www.doubao.com" target="_blank" rel="noopener">豆包</a>
+<a href="https://yuanbao.tencent.com" target="_blank" rel="noopener">腾讯元宝</a>
+<a href="https://www.kimi.com" target="_blank" rel="noopener">Kimi</a>
+</div>
+<a class="byok-link" onclick="gotoSettingsFromPrompt()">我有自己的 API Key，想在页内直接聊 →</a>
+</div>
+<div class="modal-foot">
+<button class="btn btn-primary" style="flex:1" onclick="copyPrompt()">一键复制提示词</button>
+</div>
+</div>
+</div>
+
+<!-- 需求池说明弹窗 -->
+<div class="modal-mask" id="needModal">
+<div class="modal">
+<div class="modal-head"><span class="modal-title">转化需求 · 怎么玩</span>
+<button class="modal-close" onclick="hideModal('needModal')">×</button></div>
+<div class="modal-body">
+<div class="form-tip" style="margin-top:0">
+这条资讯触发了你的什么灵感？去腾讯文档「需求池」子表填一行：<br>
+① <b>需求标题</b>：一句话说清想要什么<br>
+② <b>使用场景</b>：谁在什么情况下会用到<br>
+③ <b>期望效果</b>：做成什么样算解决问题<br><br>
+需求池每周五异步评审，被挑中的会进入产品讨论。填一行只要 1 分钟。
+</div>
+</div>
+<div class="modal-foot">
+<a class="btn btn-primary" style="flex:1;text-align:center;text-decoration:none" href="__SHEET__" target="_blank" rel="noopener">前往腾讯文档填写 →</a>
 </div>
 </div>
 </div>
